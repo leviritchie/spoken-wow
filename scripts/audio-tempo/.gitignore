@@ -1,0 +1,9 @@
+**/bin/
+**/obj/
+**/artifacts/
+**/*.ogg
+**/*.mp3
+**/*.wav
+**/manifest.json
+**/checkpoints/
+**/fixtures/

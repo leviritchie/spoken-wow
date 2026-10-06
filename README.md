@@ -1,3 +1,9 @@
+> **Unofficial 1.5x speech-tempo fork:** This fork adds the validated, installation-specific
+> [audio conversion reference tool](scripts/audio-tempo/README.md) and its
+> [validation record](scripts/audio-tempo/VALIDATION.md). It does not modify the player
+> or redistribute converted recordings. The tool is pinned to English audio packs 2.2.1,
+> not a universal installer. Upstream source and license notices remain below and intact.
+
 # Spoken
 
 Discord: https://discord.gg/HEGUgn6Yf
