@@ -1,4 +1,4 @@
-# 1.5x Quest Speech: Validated Reference Tool
+# Quest Speech Tempo: Validated Reference Tools
 
 This fork adds the source of a tested local audio-tempo conversion to
 [Rusty Key's Spoken project](https://github.com/rusty-key/spoken-wow). Upstream
@@ -53,6 +53,7 @@ dotnet $tool benchmark --count 32
 dotnet $tool build --workers 8
 # Close the target WoW client before either live-write action:
 dotnet $tool deploy
+dotnet $tool deploy-adaptive
 dotnet $tool validate
 dotnet $tool restore
 ```
@@ -95,3 +96,30 @@ only to that directory, not to the game. See `VALIDATION.md` for achieved proof.
 This is an unofficial fan-work fork, not an upstream release or endorsement by
 Rusty Key, Blizzard Entertainment, ElevenLabs, or Fish Audio. Upstream copyright, MIT
 notice, and third-party notices remain in their original files.
+
+## Adaptive Per-Clip Pacing
+
+Blanket 1.5x made already-fast speakers too fast. `adaptive/` holds the
+analysis/candidate tooling that replaced it on the tested installation:
+
+- `AdaptiveAudioBatch.py` (with `AdaptiveAudioPilot.py`) transcribes each
+  immutable original once with a pinned faster-whisper `small.en` model, measures
+  phrase-level speaking pace with long pauses excluded, and picks a per-clip
+  tempo factor between 1.0 and 1.5. The target is calibrated from one
+  listener-approved 1.5x reference clip; an upper-tail ceiling keeps
+  fast passages from being pushed further. It only speeds up, never slows down.
+- Clips it cannot measure confidently (too short for phrase windows,
+  transcript/alignment mismatch, low ASR confidence) or whose fast passages
+  already exceed the ceiling are flagged and emitted as byte-identical
+  originals. Nothing is silently guessed.
+- Output is candidate-only. `AdaptiveAudioBatch.py --validate` re-checks source
+  and candidate hashes, exact coverage, full decodes, and measured timing tables.
+- `SpokenAudioBatch deploy-adaptive` installs one pinned, validated adaptive run
+  with the same guarded per-file replacement as `deploy`, binding each candidate
+  to the stage's original hash. `validate` reports which complete set
+  (Faster or Adaptive) is installed; `restore` returns to originals from either.
+
+The run directory is hardcoded in `Program.cs`, like the other paths.
+Python requirements: faster-whisper 1.2.1 (CUDA or CPU), FFmpeg on a supplied
+path. Run `python AdaptiveAudioBatch.py --help` and `--self-test`; the full
+corpus scope requires an explicit approval phrase. See `VALIDATION.md`.

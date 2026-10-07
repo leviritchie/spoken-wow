@@ -51,3 +51,24 @@ The two-clip pilot round trip does not prove full-corpus restoration.
 The four English 2.2.1 packs and the installation-specific baseline are the
 tested scope. Other layouts, corpus versions, operating systems, paths, and
 new recovery mechanisms require their own validation.
+
+## Adaptive Pacing (October 7, 2026)
+
+Same machine and corpus. faster-whisper 1.2.1 `small.en`, pinned revision, one
+resident CUDA process, eight candidate workers.
+
+- 12,963 / 12,963 clips analyzed from preserved originals: 10,708 proposals
+  (7,780 tempo-encoded, 2,928 kept at factor 1.0) and 2,255 flagged clips kept
+  as byte-identical originals (854 already above the fast-passage ceiling,
+  most of the rest too short for phrase-window measurement).
+- Analysis, build, and integrated validation: 104.3 minutes.
+- Standalone validator passed: all source and candidate hashes, 12,963 full
+  decodes, exact output coverage, four measured timing tables, source stage
+  manifest unchanged.
+- `deploy-adaptive` installed and post-verified all 12,967 target files; the
+  standalone installed validator reported TargetState Adaptive; no replacement
+  temporary files remained.
+
+Not yet proven: in-game playback of the adaptive set, and an adaptive-to-original
+full-corpus restore round trip. The calibration came from a two-quest listening
+pilot, not a broad listening survey.

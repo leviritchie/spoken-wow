@@ -13,6 +13,8 @@ internal static class Program
     private const string AddOns = @"V:\Games\World of Warcraft\_classic_beta_\Interface\AddOns";
     private const string Stage = @"V:\Games\WoW-Addon-Tests\SpokenQuests-All-1.5x";
     private const string Pilot = @"V:\Games\WoW-Addon-Tests\SpokenQuests-AlteredBeings-1.5x";
+    // User-authorized (2026-10-07) adaptive candidate run. Review placeholders are byte-identical originals and install at original speed.
+    private const string AdaptiveRun = @"V:\Games\WoW-Addon-Tests\SpokenQuests-Adaptive-Full-20261007-01";
     private const int BatchSize = 32;
     private static readonly string[] Packs = ["Alliance", "Horde", "Shared", "Gossip"];
     private static readonly Regex TimingLine = new(
@@ -116,10 +118,13 @@ internal static class Program
                     await BuildAsync(ffmpeg, ReadOption(args, "--workers", 0), cancel.Token);
                     break;
                 case "deploy":
-                    await ApplyAsync(faster: true, cancel.Token);
+                    await ApplyAsync(Target.Faster, cancel.Token);
+                    break;
+                case "deploy-adaptive":
+                    await ApplyAsync(Target.Adaptive, cancel.Token);
                     break;
                 case "restore":
-                    await ApplyAsync(faster: false, cancel.Token);
+                    await ApplyAsync(Target.Original, cancel.Token);
                     break;
                 case "validate":
                     ValidateInstalled();
@@ -146,6 +151,7 @@ SpokenAudioBatch inventory
 SpokenAudioBatch benchmark [--count 32]
 SpokenAudioBatch build --workers 1|2|4|8
 SpokenAudioBatch deploy
+SpokenAudioBatch deploy-adaptive
 SpokenAudioBatch validate
 SpokenAudioBatch restore
 """);
@@ -756,8 +762,100 @@ SpokenAudioBatch restore
     }
 
     private sealed record LiveFile(string Pack, string RelativePath, string Path, string Hash, bool IsTable);
+    private sealed record StagedFile(string Sha256, string Path);
+    private sealed record AdaptiveSet(Dictionary<string, StagedFile> Audio, Dictionary<string, StagedFile> Tables, int Placeholders);
+    private enum Target { Original, Faster, Adaptive }
 
-    private static List<LiveFile> ReadLiveInventory(RunManifest manifest, string? desired = null)
+    private static string AdaptivePath(string relative) => Under(AdaptiveRun, relative);
+
+    // Binds the adaptive run to this stage by content: every candidate's source hash must equal the stage original hash,
+    // so a later legacy deploy/restore rewriting the stage manifest status does not break the binding.
+    // Not validated here: full candidate decode; that is AdaptiveAudioBatch.py --validate and must pass before deploy-adaptive.
+    // verifyFiles=false only recognises adaptive hashes from run-manifest.json so deploy/restore never depend on the candidate files.
+    private static AdaptiveSet LoadAdaptiveSet(RunManifest manifest, bool verifyFiles)
+    {
+        using var document = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(AdaptiveRun, "run-manifest.json")));
+        var root = document.RootElement;
+        if (root.GetProperty("schema").GetInt32() != 3 || root.GetProperty("scope").GetString() != "full" ||
+            root.GetProperty("status").GetString() != "candidate_only_review_required" ||
+            root.GetProperty("validation").GetProperty("status").GetString() != "passed" ||
+            !string.Equals(Path.GetFullPath(root.GetProperty("stage").GetString()!), Path.GetFullPath(Stage), StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("Adaptive run manifest is not the validated full-corpus run for this stage.");
+        var stageItems = manifest.Audio.ToDictionary(item => AudioKey(item.Pack, item.RelativePath), StringComparer.Ordinal);
+        var audio = new Dictionary<string, StagedFile>(StringComparer.Ordinal);
+        var durations = new Dictionary<string, double>(StringComparer.Ordinal);
+        var placeholders = 0;
+        foreach (var candidate in root.GetProperty("candidate_items").EnumerateArray())
+        {
+            var pack = candidate.GetProperty("pack").GetString()!;
+            var relative = candidate.GetProperty("relative_path").GetString()!;
+            var key = AudioKey(pack, relative);
+            if (!stageItems.TryGetValue(key, out var item)) throw new InvalidDataException($"Adaptive candidate is outside the frozen corpus: {key}");
+            if (!HashEquals(candidate.GetProperty("source_sha256").GetString()!, item.OriginalSha256)) throw new InvalidDataException($"Adaptive candidate source hash differs from stage original: {key}");
+            if (candidate.GetProperty("candidate_path").GetString() != $"candidate_packs/{pack}/{relative}") throw new InvalidDataException($"Adaptive candidate path contract violated: {key}");
+            if (candidate.GetProperty("decode_status").GetString() != "passed") throw new InvalidDataException($"Adaptive candidate did not pass decode: {key}");
+            var sha = NormalizeHash(candidate.GetProperty("candidate_sha256").GetString()!);
+            var status = candidate.GetProperty("proposal_status").GetString();
+            if (status == "review")
+            {
+                if (!HashEquals(sha, item.OriginalSha256)) throw new InvalidDataException($"Review placeholder is not the exact original: {key}");
+                placeholders++;
+            }
+            else if (status != "ready") throw new InvalidDataException($"Unknown adaptive proposal status for {key}: {status}");
+            var path = AdaptivePath(Path.Combine("candidate_packs", pack, relative));
+            if (verifyFiles && !HashEquals(HashFile(path), sha)) throw new InvalidDataException($"Adaptive staged clip hash mismatch: {key}");
+            if (!audio.TryAdd(key, new StagedFile(sha, path))) throw new InvalidDataException($"Duplicate adaptive candidate: {key}");
+            durations[AudioKey(pack, item.Key)] = candidate.GetProperty("decode").GetProperty("duration").GetDouble();
+        }
+        if (audio.Count != stageItems.Count) throw new InvalidDataException("Adaptive run does not cover the exact frozen corpus.");
+        var tables = new Dictionary<string, StagedFile>(StringComparer.Ordinal);
+        foreach (var output in root.GetProperty("table_outputs").EnumerateArray())
+        {
+            var pack = output.GetProperty("pack").GetString()!;
+            var tableRecord = manifest.Tables.Single(table => table.Pack == pack);
+            if (output.GetProperty("relative_path").GetString() != $"candidate_packs/{pack}/{tableRecord.RelativePath}") throw new InvalidDataException($"Adaptive table path contract violated: {pack}");
+            var path = AdaptivePath(Path.Combine("candidate_packs", pack, tableRecord.RelativePath));
+            var sha = NormalizeHash(output.GetProperty("sha256").GetString()!);
+            if (!tables.TryAdd(pack, new StagedFile(sha, path))) throw new InvalidDataException($"Duplicate adaptive table: {pack}");
+            if (!verifyFiles) continue;
+            var bytes = File.ReadAllBytes(path);
+            if (!HashEquals(HashBytes(bytes), sha)) throw new InvalidDataException($"Adaptive timing hash mismatch: {pack}");
+            var adaptive = ParseTiming(bytes, pack + " adaptive table");
+            var original = ParseTiming(File.ReadAllBytes(OriginalPath(pack, tableRecord.RelativePath)), pack + " original table");
+            var keys = manifest.Audio.Where(item => item.Pack == pack).Select(item => item.Key).ToArray();
+            EnsureExactKeys(pack, keys, adaptive.Values.Keys);
+            foreach (var key in keys)
+                if (double.Parse(adaptive.Values[key], CultureInfo.InvariantCulture) != durations[AudioKey(pack, key)])
+                    throw new InvalidDataException($"Adaptive timing differs from measured candidate duration: {pack}/{key}");
+            if (!string.Equals(MaskTiming(original.Text, keys), MaskTiming(adaptive.Text, keys), StringComparison.Ordinal))
+                throw new InvalidDataException($"Adaptive timing table has unrelated changes: {pack}");
+        }
+        if (!tables.Keys.ToHashSet(StringComparer.Ordinal).SetEquals(Packs)) throw new InvalidDataException("Adaptive run does not cover each timing table.");
+        return new AdaptiveSet(audio, tables, placeholders);
+    }
+
+    private static StagedFile StagedFor(Target target, RunManifest manifest, Dictionary<string, AudioItem> audioByKey, AdaptiveSet adaptive, string pack, string relativePath, bool isTable)
+    {
+        if (isTable)
+        {
+            var table = manifest.Tables.Single(entry => entry.Pack == pack);
+            return target switch
+            {
+                Target.Original => new StagedFile(table.OriginalSha256, OriginalPath(pack, table.RelativePath)),
+                Target.Faster => new StagedFile(table.FasterSha256!, FasterPath(pack, table.RelativePath)),
+                _ => adaptive.Tables[pack],
+            };
+        }
+        var item = audioByKey[AudioKey(pack, relativePath)];
+        return target switch
+        {
+            Target.Original => new StagedFile(item.OriginalSha256, OriginalPath(pack, relativePath)),
+            Target.Faster => new StagedFile(item.FasterSha256!, FasterPath(pack, relativePath)),
+            _ => adaptive.Audio[AudioKey(pack, relativePath)],
+        };
+    }
+
+    private static List<LiveFile> ReadLiveInventory(RunManifest manifest, AdaptiveSet adaptive, bool checkTemporaries = false)
     {
         var records = manifest.Audio.ToDictionary(item => AudioKey(item.Pack, item.RelativePath), StringComparer.Ordinal);
         var live = new List<LiveFile>(manifest.Audio.Count + Packs.Length);
@@ -774,9 +872,10 @@ SpokenAudioBatch restore
             {
                 AssertNoReparse(item.Path, root);
                 var hash = HashFile(item.Path);
-                var record = records[AudioKey(pack, item.RelativePath)];
+                var key = AudioKey(pack, item.RelativePath);
+                var record = records[key];
                 var faster = record.FasterSha256;
-                if (!HashEquals(hash, record.OriginalSha256) && (faster is null || !HashEquals(hash, faster)))
+                if (!HashEquals(hash, record.OriginalSha256) && (faster is null || !HashEquals(hash, faster)) && !HashEquals(hash, adaptive.Audio[key].Sha256))
                     throw new InvalidDataException($"Live clip has an unknown hash: {pack}/{item.RelativePath}");
                 live.Add(new LiveFile(pack, item.RelativePath, item.Path, hash, false));
             }
@@ -786,11 +885,11 @@ SpokenAudioBatch restore
             var table = manifest.Tables.Single(entry => entry.Pack == pack);
             var tableHash = HashFile(tablePath);
             if (!HashEquals(tableHash, table.OriginalSha256) && (table.FasterSha256 is null || !HashEquals(tableHash, table.FasterSha256)) &&
-                (table.InitialPilotSha256 is null || !HashEquals(tableHash, table.InitialPilotSha256)))
+                (table.InitialPilotSha256 is null || !HashEquals(tableHash, table.InitialPilotSha256)) && !HashEquals(tableHash, adaptive.Tables[pack].Sha256))
                 throw new InvalidDataException($"Live timing table has an unknown hash: {pack}");
             live.Add(new LiveFile(pack, tableRelative, tablePath, tableHash, true));
         }
-        if (desired is not null)
+        if (checkTemporaries)
         {
             foreach (var item in live)
             {
@@ -827,43 +926,49 @@ SpokenAudioBatch restore
         }
     }
 
-    private static async Task ApplyAsync(bool faster, CancellationToken token)
+    private static async Task ApplyAsync(Target target, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         AssertGameStopped();
         var manifest = LoadManifest();
         VerifyBuiltStage(manifest);
-        var live = ReadLiveInventory(manifest, faster ? "Faster" : "Original");
+        var adaptive = LoadAdaptiveSet(manifest, verifyFiles: target == Target.Adaptive);
+        var live = ReadLiveInventory(manifest, adaptive, checkTemporaries: true);
         var audioByKey = manifest.Audio.ToDictionary(item => AudioKey(item.Pack, item.RelativePath), StringComparer.Ordinal);
-        var tablesByPack = manifest.Tables.ToDictionary(item => item.Pack, StringComparer.Ordinal);
         foreach (var pack in Packs)
         {
             token.ThrowIfCancellationRequested();
-            foreach (var target in live.Where(item => item.Pack == pack && !item.IsTable))
+            foreach (var file in live.Where(item => item.Pack == pack && !item.IsTable))
             {
                 token.ThrowIfCancellationRequested();
-                var item = audioByKey[AudioKey(pack, target.RelativePath)];
-                var hash = faster ? item.FasterSha256! : item.OriginalSha256;
-                AtomicReplace(faster ? FasterPath(pack, item.RelativePath) : OriginalPath(pack, item.RelativePath), target, hash);
+                var staged = StagedFor(target, manifest, audioByKey, adaptive, pack, file.RelativePath, isTable: false);
+                AtomicReplace(staged.Path, file, staged.Sha256);
             }
             var table = live.Single(item => item.Pack == pack && item.IsTable);
-            var tableRecord = tablesByPack[pack];
-            AtomicReplace(faster ? FasterPath(pack, table.RelativePath) : OriginalPath(pack, table.RelativePath), table,
-                faster ? tableRecord.FasterSha256! : tableRecord.OriginalSha256);
+            var stagedTable = StagedFor(target, manifest, audioByKey, adaptive, pack, table.RelativePath, isTable: true);
+            AtomicReplace(stagedTable.Path, table, stagedTable.Sha256);
             Console.WriteLine($"{pack}: clips and timing table processed");
         }
-        var expected = faster ? "Faster" : "Original";
-        var after = ReadLiveInventory(manifest);
+        var after = ReadLiveInventory(manifest, adaptive);
         foreach (var item in after)
+            if (!HashEquals(item.Hash, StagedFor(target, manifest, audioByKey, adaptive, item.Pack, item.RelativePath, item.IsTable).Sha256))
+                throw new InvalidDataException($"Post-deployment {target} hash mismatch: {item.Pack}/{item.RelativePath}");
+        if (target == Target.Adaptive)
         {
-            var hash = item.IsTable
-                ? (faster ? tablesByPack[item.Pack].FasterSha256! : tablesByPack[item.Pack].OriginalSha256)
-                : (faster ? audioByKey[AudioKey(item.Pack, item.RelativePath)].FasterSha256! : audioByKey[AudioKey(item.Pack, item.RelativePath)].OriginalSha256);
-            if (!HashEquals(item.Hash, hash)) throw new InvalidDataException($"Post-deployment {expected} hash mismatch: {item.Pack}/{item.RelativePath}");
+            // The frozen stage manifest is the adaptive run's immutable source; record adaptive deployments beside the run instead.
+            var record = Path.Combine(AdaptiveRun, $"deployment-{DateTime.UtcNow:yyyyMMddTHHmmssZ}.json");
+            WriteCreateNew(record, JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                Status = "AdaptiveDeployed", AddOns, DeployedAtUtc = DateTime.UtcNow, AudioFiles = adaptive.Audio.Count,
+                ReviewPlaceholdersAtOriginalSpeed = adaptive.Placeholders, TimingTables = adaptive.Tables.Count, VerifiedInstalledFiles = after.Count,
+            }, JsonOptions));
         }
-        manifest.Status = faster ? "Deployed" : "Restored";
-        SaveManifest(manifest);
-        Console.WriteLine($"{expected} set verified: {after.Count} installed files. In WoW, /reload refreshes addon metadata.");
+        else
+        {
+            manifest.Status = target == Target.Faster ? "Deployed" : "Restored";
+            SaveManifest(manifest);
+        }
+        Console.WriteLine($"{target} set verified: {after.Count} installed files. In WoW, /reload refreshes addon metadata.");
         await Task.CompletedTask;
     }
 
@@ -880,31 +985,24 @@ SpokenAudioBatch restore
         }
     }
 
+    // Valid means every installed file matches one complete deployable set (Adaptive or Faster). Adaptive is checked first
+    // because its factor-1 copies and placeholders share original hashes, so the sets overlap only through originals.
     private static void ValidateInstalled()
     {
         var manifest = LoadManifest();
         VerifyBuiltStage(manifest);
-        var live = ReadLiveInventory(manifest);
+        var adaptive = LoadAdaptiveSet(manifest, verifyFiles: true);
+        var live = ReadLiveInventory(manifest, adaptive);
         var audioByKey = manifest.Audio.ToDictionary(item => AudioKey(item.Pack, item.RelativePath), StringComparer.Ordinal);
-        var tablesByPack = manifest.Tables.ToDictionary(item => item.Pack, StringComparer.Ordinal);
-        var allFaster = true;
-        var anyFaster = false;
-        foreach (var item in live)
+        bool Matches(Target target) => live.All(item => HashEquals(item.Hash, StagedFor(target, manifest, audioByKey, adaptive, item.Pack, item.RelativePath, item.IsTable).Sha256));
+        Target? installed = Matches(Target.Adaptive) ? Target.Adaptive : Matches(Target.Faster) ? Target.Faster : null;
+        if (installed is null)
         {
-            var fasterHash = item.IsTable ? tablesByPack[item.Pack].FasterSha256! : audioByKey[AudioKey(item.Pack, item.RelativePath)].FasterSha256!;
-            var originalHash = item.IsTable ? tablesByPack[item.Pack].OriginalSha256 : audioByKey[AudioKey(item.Pack, item.RelativePath)].OriginalSha256;
-            if (HashEquals(item.Hash, fasterHash)) anyFaster = true;
-            else allFaster = false;
+            if (Matches(Target.Original)) throw new InvalidDataException("Installed files are original; Validate requires a complete Faster or Adaptive deployment.");
+            throw new InvalidDataException("Known partial deployment detected; Validate fails until deploy, deploy-adaptive or restore completes all files.");
         }
-        if (!allFaster)
-        {
-            if (anyFaster) throw new InvalidDataException("Known partial deployment detected; Validate fails until Deploy or Restore completes all files.");
-            throw new InvalidDataException("Installed files are original, not faster; Validate requires the complete 1.5x deployment.");
-        }
-        Console.WriteLine(JsonSerializer.Serialize(new { Status = "Valid", TargetState = "Faster", AudioFiles = manifest.Audio.Count, TimingTables = manifest.Tables.Count, VerifiedInstalledFiles = live.Count }, JsonOptions));
+        Console.WriteLine(JsonSerializer.Serialize(new { Status = "Valid", TargetState = installed.ToString(), AudioFiles = manifest.Audio.Count, TimingTables = manifest.Tables.Count, VerifiedInstalledFiles = live.Count }, JsonOptions));
     }
-
-
 
     private static PilotSeed LoadPilotSeed()
     {

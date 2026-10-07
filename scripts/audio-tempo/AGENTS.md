@@ -15,3 +15,7 @@
   achieved proof, not permission to claim newly changed code already tested.
 - Do not modify upstream player/core code for tempo changes. The native audio
   data-pack path owns this change. Preserve clip stems and lookup contracts.
+- `adaptive/` produces candidate-only output and never deploys. Only
+  `SpokenAudioBatch deploy-adaptive` installs an adaptive run, and only the
+  pinned run whose candidates bind to the stage's original hashes. Flagged
+  clips stay byte-identical originals; do not add guessed factors for them.
